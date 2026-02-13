@@ -31,6 +31,39 @@ def _first_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | Non
     return None
 
 
+def _coalesce_numeric_columns(df: pd.DataFrame, candidates: list[str]) -> pd.Series:
+    existing = [name for name in candidates if name in df.columns]
+    if not existing:
+        return pd.Series(np.nan, index=df.index, dtype="float64")
+    vals = df[existing].apply(pd.to_numeric, errors="coerce")
+    return vals.bfill(axis=1).iloc[:, 0]
+
+
+def _normalize_fundamental_aliases(df_fund: pd.DataFrame) -> pd.DataFrame:
+    if df_fund.empty:
+        return df_fund.copy()
+
+    work = df_fund.copy()
+    pe_candidates = ["trailingPE", "trailingPe", "trailing_pe", "peRatio", "pe_ratio"]
+    if any(name in work.columns for name in pe_candidates):
+        work["trailingPE"] = _coalesce_numeric_columns(work, pe_candidates)
+
+    ps_candidates = [
+        "priceToSalesTrailing12Months",
+        "priceToSalesTrailingTwelveMonths",
+        "priceToSales",
+        "price_to_sales",
+        "psRatio",
+    ]
+    if any(name in work.columns for name in ps_candidates):
+        work["priceToSalesTrailing12Months"] = _coalesce_numeric_columns(work, ps_candidates)
+
+    peg_candidates = ["pegRatio", "trailingPegRatio", "peg_ratio"]
+    if any(name in work.columns for name in peg_candidates):
+        work["pegRatio"] = _coalesce_numeric_columns(work, peg_candidates)
+    return work
+
+
 def _normalize_ratio_series(series: pd.Series) -> pd.Series:
     s = pd.to_numeric(series, errors="coerce")
     # Some feeds provide percent points (e.g. 25 for 25%), convert to decimal.
@@ -86,7 +119,7 @@ def filter_diagnostics(df_fund: pd.DataFrame, df_price: pd.DataFrame, cfg: AppCo
     if prices.empty or "ticker" not in df_fund.columns:
         return pd.DataFrame(columns=["step", "count"])
 
-    funds = df_fund.drop_duplicates(subset=["ticker"]).set_index("ticker")
+    funds = _normalize_fundamental_aliases(df_fund).drop_duplicates(subset=["ticker"]).set_index("ticker")
     all_tickers = set(prices["ticker"].dropna().unique())
     step_sets: list[tuple[str, set[str]]] = [("universe", all_tickers)]
 
@@ -144,7 +177,7 @@ def apply_hard_filters(df_fund: pd.DataFrame, df_price: pd.DataFrame, cfg: AppCo
         if "marketCap" not in df_fund.columns:
             df_fund["marketCap"] = np.nan
 
-    funds = df_fund.drop_duplicates(subset=["ticker"]).set_index("ticker")
+    funds = _normalize_fundamental_aliases(df_fund).drop_duplicates(subset=["ticker"]).set_index("ticker")
     counts = _counts_by_ticker(prices)
     adv = _average_daily_dollar_volume(prices)
 
@@ -265,10 +298,7 @@ def compute_quality_value_factors(df_fund: pd.DataFrame) -> pd.DataFrame:
             ]
         )
 
-    peg_col = _first_existing_column(df_fund, ["pegRatio", "trailingPegRatio"])
-    work = df_fund.copy()
-    if peg_col is not None and peg_col != "pegRatio":
-        work["pegRatio"] = work[peg_col]
+    work = _normalize_fundamental_aliases(df_fund)
 
     cols = [c for c in QUALITY_VALUE_COLUMNS if c in work.columns]
     out = work[["ticker", *cols]].drop_duplicates(subset=["ticker"]).copy()

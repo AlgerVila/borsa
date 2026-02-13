@@ -34,3 +34,21 @@ def test_quality_factors_normalize_ratios_and_aliases() -> None:
     assert round(float(out["pegRatio"]), 4) == 1.8
     assert round(float(out["debtToEquity"]), 4) == 1.4
     assert round(float(out["fcf_yield"]), 4) == 0.10
+
+
+def test_quality_factors_use_pe_ps_alias_columns() -> None:
+    df = pd.DataFrame(
+        [
+            {
+                "ticker": "AAA",
+                "trailingPe": 28.0,
+                "priceToSales": 6.5,
+                "trailingPegRatio": 1.7,
+            }
+        ]
+    )
+    out = compute_quality_value_factors(df).iloc[0]
+
+    assert round(float(out["trailingPE"]), 4) == 28.0
+    assert round(float(out["priceToSalesTrailing12Months"]), 4) == 6.5
+    assert round(float(out["pegRatio"]), 4) == 1.7

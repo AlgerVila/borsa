@@ -135,20 +135,40 @@ def _factor_contribution_frame(topn: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _coalesce_numeric_candidates(df: pd.DataFrame, candidates: list[str]) -> pd.Series:
+    existing = [col for col in candidates if col in df.columns]
+    if not existing:
+        return pd.Series(float("nan"), index=df.index, dtype="float64")
+    vals = df[existing].apply(pd.to_numeric, errors="coerce")
+    return vals.bfill(axis=1).iloc[:, 0]
+
+
 def _merge_raw_valuation(topn: pd.DataFrame, fundamentals: pd.DataFrame) -> pd.DataFrame:
     left = topn.loc[:, ~topn.columns.duplicated(keep="first")].copy()
     right = fundamentals.loc[:, ~fundamentals.columns.duplicated(keep="first")].copy()
 
-    value_cols: list[str] = [c for c in ["ticker", "trailingPE", "priceToSalesTrailing12Months"] if c in right.columns]
-    raw = right[value_cols].copy() if value_cols else right[["ticker"]].copy()
+    raw = right[["ticker"]].copy() if "ticker" in right.columns else pd.DataFrame(columns=["ticker"])
 
-    peg_candidates = [c for c in ["pegRatio", "trailingPegRatio"] if c in right.columns]
-    if peg_candidates:
-        raw["raw_pegRatio"] = right[peg_candidates].bfill(axis=1).iloc[:, 0]
-    if "trailingPE" in raw.columns:
-        raw = raw.rename(columns={"trailingPE": "raw_trailingPE"})
-    if "priceToSalesTrailing12Months" in raw.columns:
-        raw = raw.rename(columns={"priceToSalesTrailing12Months": "raw_priceToSalesTrailing12Months"})
+    pe_series = _coalesce_numeric_candidates(right, ["trailingPE", "trailingPe", "trailing_pe", "peRatio", "pe_ratio"])
+    if pe_series.notna().any():
+        raw["raw_trailingPE"] = pe_series
+
+    ps_series = _coalesce_numeric_candidates(
+        right,
+        [
+            "priceToSalesTrailing12Months",
+            "priceToSalesTrailingTwelveMonths",
+            "priceToSales",
+            "price_to_sales",
+            "psRatio",
+        ],
+    )
+    if ps_series.notna().any():
+        raw["raw_priceToSalesTrailing12Months"] = ps_series
+
+    peg_series = _coalesce_numeric_candidates(right, ["pegRatio", "trailingPegRatio", "peg_ratio"])
+    if peg_series.notna().any():
+        raw["raw_pegRatio"] = peg_series
 
     merged = left.merge(raw, on="ticker", how="left")
     merged = merged.loc[:, ~merged.columns.duplicated(keep="first")]
@@ -257,6 +277,126 @@ def _top_table_column_config(columns: list[str]) -> dict[str, object]:
             "Earnings Growth Score",
             help="Percentile score (0-100) for earnings growth; higher is better.",
             format="%.1f",
+        )
+    return config
+
+
+def _snapshot_raw_table_column_config(columns: list[str]) -> dict[str, object]:
+    config: dict[str, object] = {}
+    if "ticker" in columns:
+        config["ticker"] = st.column_config.TextColumn(
+            "Ticker",
+            help="Stock symbol in Yahoo-compatible format.",
+        )
+    if "trailingPE" in columns:
+        config["trailingPE"] = st.column_config.NumberColumn(
+            "Trailing P/E",
+            help="Trailing Price-to-Earnings ratio from Yahoo fundamentals (or derived from price and trailing EPS).",
+            format="%.2f",
+        )
+    if "priceToSalesTrailing12Months" in columns:
+        config["priceToSalesTrailing12Months"] = st.column_config.NumberColumn(
+            "Trailing P/S (TTM)",
+            help="Price-to-Sales ratio from Yahoo fundamentals (or derived from market cap and revenue).",
+            format="%.2f",
+        )
+    if "pegRatio" in columns:
+        config["pegRatio"] = st.column_config.NumberColumn(
+            "PEG Ratio",
+            help="Price/Earnings-to-Growth ratio from Yahoo fundamentals.",
+            format="%.2f",
+        )
+    return config
+
+
+def _snapshot_history_table_column_config(columns: list[str]) -> dict[str, object]:
+    config: dict[str, object] = {}
+    if "snapshot_date" in columns:
+        config["snapshot_date"] = st.column_config.TextColumn(
+            "Snapshot Date",
+            help="Historical month-end date used to recompute the model.",
+        )
+    if "included" in columns:
+        config["included"] = st.column_config.CheckboxColumn(
+            "Included",
+            help="True when the ticker passed hard filters in that historical snapshot.",
+        )
+    if "score_mode" in columns:
+        config["score_mode"] = st.column_config.TextColumn(
+            "Score Source",
+            help="`model` = full model score, `diagnostic_estimate` = fallback estimate when strict filters excluded the ticker.",
+        )
+    if "rank" in columns:
+        config["rank"] = st.column_config.NumberColumn(
+            "Rank",
+            help="Cross-sectional rank at that snapshot date (lower is better).",
+            format="%.0f",
+        )
+    if "final_score" in columns:
+        config["final_score"] = st.column_config.NumberColumn(
+            "Final Score",
+            help="Composite model score at that snapshot.",
+            format="%.2f",
+        )
+    if "value_score" in columns:
+        config["value_score"] = st.column_config.NumberColumn(
+            "Value Score",
+            help="Valuation sub-score at that snapshot (higher is better).",
+            format="%.1f",
+        )
+    if "quality_score" in columns:
+        config["quality_score"] = st.column_config.NumberColumn(
+            "Quality Score",
+            help="Profitability and efficiency sub-score at that snapshot (higher is better).",
+            format="%.1f",
+        )
+    if "growth_score" in columns:
+        config["growth_score"] = st.column_config.NumberColumn(
+            "Growth Score",
+            help="Revenue and earnings growth sub-score at that snapshot (higher is better).",
+            format="%.1f",
+        )
+    if "stability_score" in columns:
+        config["stability_score"] = st.column_config.NumberColumn(
+            "Stability Score",
+            help="Risk stability sub-score at that snapshot (higher is more stable).",
+            format="%.1f",
+        )
+    if "momentum_score" in columns:
+        config["momentum_score"] = st.column_config.NumberColumn(
+            "Momentum Score",
+            help="Trend/momentum sub-score at that snapshot (higher is stronger momentum).",
+            format="%.1f",
+        )
+    if "gain_score" in columns:
+        config["gain_score"] = st.column_config.NumberColumn(
+            "Gain Score",
+            help="Upside proxy blended from value, quality, growth, and momentum.",
+            format="%.1f",
+        )
+    if "risk_score" in columns:
+        config["risk_score"] = st.column_config.NumberColumn(
+            "Risk Score",
+            help="Downside-risk proxy derived mainly from stability factors.",
+            format="%.1f",
+        )
+    if "reward_to_risk" in columns:
+        config["reward_to_risk"] = st.column_config.NumberColumn(
+            "Reward/Risk",
+            help="Gain Score divided by Risk Score (+1 guard). Higher usually indicates better modeled upside per risk unit.",
+            format="%.2f",
+        )
+    if "next_month_return" in columns:
+        config["next_month_return"] = st.column_config.NumberColumn(
+            "Next-Month Return",
+            help="Realized return from this snapshot close to the next snapshot close (decimal return).",
+            format="%.4f",
+        )
+    if "return_to_asof" in columns:
+        config["return_to_asof"] = st.column_config.NumberColumn(
+            "Return to As-Of",
+            help="Realized return from this snapshot close to the current as-of date close (decimal return).",
+            format="%.4f",
         )
     return config
 
@@ -613,17 +753,31 @@ def _render_ticker_snapshot_screen(cfg: AppConfig, args: dict[str, object]) -> N
             fig_rg.update_layout(height=360, xaxis_title="Risk score (higher riskier)", yaxis_title="Gain score")
             st.plotly_chart(fig_rg, width="stretch")
 
-    peg_col = "pegRatio" if "pegRatio" in funds.columns else "trailingPegRatio" if "trailingPegRatio" in funds.columns else None
-    raw_cols = [c for c in ["ticker", "trailingPE", "priceToSalesTrailing12Months"] if c in funds.columns]
-    if peg_col:
-        raw_cols.append(peg_col)
-    raw_row = funds[funds["ticker"] == ticker]
-    if not raw_row.empty and raw_cols:
-        raw_display = raw_row[raw_cols].copy()
-        if peg_col and peg_col != "pegRatio":
-            raw_display = raw_display.rename(columns={peg_col: "pegRatio"})
+    raw_row = funds[funds["ticker"] == ticker].head(1).copy()
+    if not raw_row.empty:
+        raw_display = raw_row[["ticker"]].copy()
+        raw_display["trailingPE"] = _coalesce_numeric_candidates(raw_row, ["trailingPE", "trailingPe", "trailing_pe", "peRatio", "pe_ratio"])
+        raw_display["priceToSalesTrailing12Months"] = _coalesce_numeric_candidates(
+            raw_row,
+            [
+                "priceToSalesTrailing12Months",
+                "priceToSalesTrailingTwelveMonths",
+                "priceToSales",
+                "price_to_sales",
+                "psRatio",
+            ],
+        )
+        raw_display["pegRatio"] = _coalesce_numeric_candidates(raw_row, ["pegRatio", "trailingPegRatio", "peg_ratio"])
+        raw_display = raw_display.dropna(axis=1, how="all")
+
+    if not raw_row.empty and len(raw_display.columns) > 1:
         st.caption("Current raw valuation fields from fundamentals snapshot")
-        st.dataframe(raw_display, hide_index=True, width="stretch")
+        st.dataframe(
+            raw_display,
+            hide_index=True,
+            width="stretch",
+            column_config=_snapshot_raw_table_column_config(list(raw_display.columns)),
+        )
 
     st.caption("Snapshot table")
     show_cols = [
@@ -647,7 +801,12 @@ def _render_ticker_snapshot_screen(cfg: AppConfig, args: dict[str, object]) -> N
         ]
         if c in hist_df.columns
     ]
-    st.dataframe(hist_df[show_cols], hide_index=True, width="stretch")
+    st.dataframe(
+        hist_df[show_cols],
+        hide_index=True,
+        width="stretch",
+        column_config=_snapshot_history_table_column_config(show_cols),
+    )
 
     with st.expander("How this snapshot check works"):
         st.markdown(

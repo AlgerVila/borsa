@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -12,6 +13,82 @@ from borsa.config import cache_file_for
 
 def _period_tag(period: str) -> str:
     return period.replace(" ", "").replace("/", "_")
+
+
+def _to_float(value: object) -> float | None:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(out):
+        return None
+    return out
+
+
+def _first_numeric(mapping: dict[str, object], keys: list[str]) -> float | None:
+    for key in keys:
+        if key not in mapping:
+            continue
+        val = _to_float(mapping.get(key))
+        if val is not None:
+            return val
+    return None
+
+
+def _canonicalize_fundamental_fields(info: dict[str, object], fast_info: dict[str, object]) -> dict[str, object]:
+    merged = dict(info)
+
+    # Keep a stable market cap field when fast_info has it but info does not.
+    market_cap = _first_numeric(merged, ["marketCap"])
+    if market_cap is None:
+        market_cap = _first_numeric(fast_info, ["marketCap", "market_cap"])
+        if market_cap is not None:
+            merged["marketCap"] = market_cap
+
+    price = _first_numeric(merged, ["currentPrice", "regularMarketPrice", "previousClose"])
+    if price is None:
+        price = _first_numeric(fast_info, ["lastPrice", "last_price", "regularMarketPrice"])
+        if price is not None:
+            merged["currentPrice"] = price
+
+    trailing_pe = _first_numeric(merged, ["trailingPE", "trailingPe", "trailing_pe"])
+    if trailing_pe is None:
+        trailing_pe = _first_numeric(fast_info, ["trailingPE", "trailing_pe", "peRatio", "pe_ratio"])
+    if trailing_pe is None and price is not None:
+        trailing_eps = _first_numeric(merged, ["trailingEps", "epsTrailingTwelveMonths", "trailing_eps"])
+        if trailing_eps is not None and trailing_eps > 0:
+            trailing_pe = price / trailing_eps
+    if trailing_pe is not None and trailing_pe > 0:
+        merged["trailingPE"] = trailing_pe
+
+    ps = _first_numeric(
+        merged,
+        [
+            "priceToSalesTrailing12Months",
+            "priceToSalesTrailingTwelveMonths",
+            "priceToSales",
+            "price_to_sales",
+            "psRatio",
+        ],
+    )
+    if ps is None:
+        ps = _first_numeric(fast_info, ["priceToSalesTrailing12Months", "price_to_sales", "psRatio"])
+    if ps is None:
+        total_revenue = _first_numeric(merged, ["totalRevenue", "revenue"])
+        if market_cap is not None and total_revenue is not None and total_revenue > 0:
+            ps = market_cap / total_revenue
+    if ps is None and price is not None:
+        revenue_per_share = _first_numeric(merged, ["revenuePerShare"])
+        if revenue_per_share is not None and revenue_per_share > 0:
+            ps = price / revenue_per_share
+    if ps is not None and ps > 0:
+        merged["priceToSalesTrailing12Months"] = ps
+
+    peg_ratio = _first_numeric(merged, ["pegRatio", "trailingPegRatio", "peg_ratio"])
+    if peg_ratio is not None and peg_ratio > 0:
+        merged["pegRatio"] = peg_ratio
+
+    return merged
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10), reraise=True)
@@ -48,11 +125,55 @@ def fetch_price_history(tickers: list[str], period: str = "2y") -> pd.DataFrame:
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10), reraise=True)
 def _fetch_single_fundamental(ticker: str) -> dict:
-    info = yf.Ticker(ticker).info
-    if not isinstance(info, dict) or not info:
+    ticker_obj = yf.Ticker(ticker)
+    info: dict[str, object] = {}
+    try:
+        fetched = ticker_obj.info
+        if isinstance(fetched, dict):
+            info = fetched
+    except Exception:
+        info = {}
+
+    if not info:
+        try:
+            fetched = ticker_obj.get_info()
+            if isinstance(fetched, dict):
+                info = fetched
+        except Exception:
+            info = {}
+
+    fast_info: dict[str, object] = {}
+    try:
+        fi = ticker_obj.fast_info
+        getter = getattr(fi, "get", None)
+        if callable(getter):
+            for key in [
+                "marketCap",
+                "market_cap",
+                "lastPrice",
+                "last_price",
+                "regularMarketPrice",
+                "trailingPE",
+                "trailing_pe",
+                "peRatio",
+                "pe_ratio",
+                "priceToSalesTrailing12Months",
+                "price_to_sales",
+            ]:
+                val = getter(key)
+                if val is not None:
+                    fast_info[key] = val
+        elif isinstance(fi, dict):
+            fast_info = fi
+    except Exception:
+        fast_info = {}
+
+    if not info and not fast_info:
         raise ValueError(f"No fundamentals for {ticker}")
-    info["ticker"] = ticker
-    return info
+
+    normalized = _canonicalize_fundamental_fields(info=info, fast_info=fast_info)
+    normalized["ticker"] = ticker
+    return normalized
 
 
 def fetch_fundamentals(tickers: list[str]) -> pd.DataFrame:
