@@ -429,6 +429,26 @@ def _compute_ticker_snapshot_history(
         rows.append(rec)
 
     snap_df = pd.DataFrame(rows).sort_values("snapshot_date").reset_index(drop=True)
+    expected_cols = [
+        "rank",
+        "final_score",
+        "value_score",
+        "quality_score",
+        "growth_score",
+        "stability_score",
+        "momentum_score",
+        "gain_score",
+        "risk_score",
+        "reward_to_risk",
+        "risk_band",
+        "trailingPE",
+        "priceToSalesTrailing12Months",
+        "pegRatio",
+    ]
+    for col in expected_cols:
+        if col not in snap_df.columns:
+            snap_df[col] = float("nan")
+
     if not snap_df.empty:
         snap_df["snapshot_date"] = pd.to_datetime(snap_df["snapshot_date"])
         snap_df["next_month_return"] = snap_df["close_price"].shift(-1) / snap_df["close_price"] - 1.0
@@ -482,15 +502,18 @@ def _render_ticker_snapshot_screen(cfg: AppConfig, args: dict[str, object]) -> N
     else:
         m3.metric("Avg Next-Month Return", "N/A")
 
-    fig_score = px.line(
-        hist_df,
-        x="snapshot_date",
-        y="final_score",
-        markers=True,
-        title=f"{ticker} Final Score over time",
-    )
-    fig_score.update_layout(height=320, xaxis_title="Snapshot date", yaxis_title="Final score")
-    st.plotly_chart(fig_score, width="stretch")
+    if "final_score" in hist_df.columns and hist_df["final_score"].notna().any():
+        fig_score = px.line(
+            hist_df,
+            x="snapshot_date",
+            y="final_score",
+            markers=True,
+            title=f"{ticker} Final Score over time",
+        )
+        fig_score.update_layout(height=320, xaxis_title="Snapshot date", yaxis_title="Final score")
+        st.plotly_chart(fig_score, width="stretch")
+    else:
+        st.info("This ticker did not pass model filters in the selected snapshots, so no Final Score trend is available.")
 
     if "rank" in hist_df.columns:
         rank_df = hist_df.copy()
