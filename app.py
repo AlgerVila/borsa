@@ -502,6 +502,19 @@ def _render_ticker_snapshot_screen(cfg: AppConfig, args: dict[str, object]) -> N
     else:
         m3.metric("Avg Next-Month Return", "N/A")
 
+    if "final_score" in hist_df.columns:
+        hist_df["final_score"] = pd.to_numeric(hist_df["final_score"], errors="coerce")
+    if "rank" in hist_df.columns:
+        hist_df["rank"] = pd.to_numeric(hist_df["rank"], errors="coerce")
+    if "gain_score" in hist_df.columns:
+        hist_df["gain_score"] = pd.to_numeric(hist_df["gain_score"], errors="coerce")
+    if "risk_score" in hist_df.columns:
+        hist_df["risk_score"] = pd.to_numeric(hist_df["risk_score"], errors="coerce")
+    if "reward_to_risk" in hist_df.columns:
+        hist_df["reward_to_risk"] = pd.to_numeric(hist_df["reward_to_risk"], errors="coerce")
+    if "next_month_return" in hist_df.columns:
+        hist_df["next_month_return"] = pd.to_numeric(hist_df["next_month_return"], errors="coerce")
+
     if "final_score" in hist_df.columns and hist_df["final_score"].notna().any():
         fig_score = px.line(
             hist_df,
@@ -515,7 +528,7 @@ def _render_ticker_snapshot_screen(cfg: AppConfig, args: dict[str, object]) -> N
     else:
         st.info("This ticker did not pass model filters in the selected snapshots, so no Final Score trend is available.")
 
-    if "rank" in hist_df.columns:
+    if "rank" in hist_df.columns and hist_df["rank"].notna().any():
         rank_df = hist_df.copy()
         fig_rank = px.line(rank_df, x="snapshot_date", y="rank", markers=True, title=f"{ticker} Rank over time")
         fig_rank.update_layout(height=320, xaxis_title="Snapshot date", yaxis_title="Rank (lower is better)")
@@ -523,17 +536,41 @@ def _render_ticker_snapshot_screen(cfg: AppConfig, args: dict[str, object]) -> N
         st.plotly_chart(fig_rank, width="stretch")
 
     if {"risk_score", "gain_score"}.issubset(hist_df.columns):
-        fig_rg = px.scatter(
-            hist_df,
-            x="risk_score",
-            y="gain_score",
-            color="snapshot_date",
-            size="reward_to_risk" if "reward_to_risk" in hist_df.columns else None,
-            title=f"{ticker} Risk vs Gain by snapshot",
-            hover_data={"snapshot_date": True, "rank": True, "final_score": ":.2f", "next_month_return": ":.2%"},
-        )
-        fig_rg.update_layout(height=360, xaxis_title="Risk score (higher riskier)", yaxis_title="Gain score")
-        st.plotly_chart(fig_rg, width="stretch")
+        rg_df = hist_df.copy()
+        rg_df = rg_df[rg_df["risk_score"].notna() & rg_df["gain_score"].notna()].copy()
+        if rg_df.empty:
+            st.info("Risk/Gain chart unavailable for this ticker because snapshot risk/gain values are missing.")
+        else:
+            size_col = None
+            if "reward_to_risk" in rg_df.columns and rg_df["reward_to_risk"].notna().any():
+                # Plotly marker size rejects NaN in some runtime versions.
+                rg_df["reward_to_risk_plot"] = rg_df["reward_to_risk"].fillna(0.0).clip(lower=0.0)
+                if (rg_df["reward_to_risk_plot"] > 0).any():
+                    size_col = "reward_to_risk_plot"
+
+            hover_data: dict[str, object] = {"snapshot_date": True}
+            if "rank" in rg_df.columns:
+                hover_data["rank"] = True
+            if "final_score" in rg_df.columns:
+                hover_data["final_score"] = ":.2f"
+            if "next_month_return" in rg_df.columns:
+                hover_data["next_month_return"] = ":.2%"
+            if "reward_to_risk" in rg_df.columns:
+                hover_data["reward_to_risk"] = ":.2f"
+            if "risk_band" in rg_df.columns:
+                hover_data["risk_band"] = True
+
+            fig_rg = px.scatter(
+                rg_df,
+                x="risk_score",
+                y="gain_score",
+                color="snapshot_date",
+                size=size_col,
+                title=f"{ticker} Risk vs Gain by snapshot",
+                hover_data=hover_data,
+            )
+            fig_rg.update_layout(height=360, xaxis_title="Risk score (higher riskier)", yaxis_title="Gain score")
+            st.plotly_chart(fig_rg, width="stretch")
 
     peg_col = "pegRatio" if "pegRatio" in funds.columns else "trailingPegRatio" if "trailingPegRatio" in funds.columns else None
     raw_cols = [c for c in ["ticker", "trailingPE", "priceToSalesTrailing12Months"] if c in funds.columns]
