@@ -48,6 +48,23 @@ def _load_benchmark(as_of: date, use_cache: bool, period: str = "10y") -> pd.Dat
     return bench
 
 
+@st.cache_data(show_spinner=False)
+def _load_snapshot_inputs(
+    as_of: date,
+    use_cache: bool,
+    period: str,
+    focus_ticker: str,
+) -> tuple[list[str], pd.DataFrame, pd.DataFrame]:
+    cfg = AppConfig()
+    cfg.ensure_dirs()
+    ndx = get_nasdaq100_tickers(as_of=as_of)
+    ticker = normalize_for_yahoo(focus_ticker)
+    tickers = sorted(set([*ndx, ticker]))
+    prices, _ = get_or_fetch_prices(tickers=tickers, as_of=as_of, cache_dir=cfg.cache_dir, period=period, use_cache=use_cache)
+    funds, _ = get_or_fetch_fundamentals(tickers=tickers, as_of=as_of, cache_dir=cfg.cache_dir, use_cache=use_cache)
+    return tickers, prices, funds
+
+
 def _apply_sidebar_config() -> tuple[AppConfig, dict[str, object]]:
     cfg = AppConfig()
     cfg.ensure_dirs()
@@ -314,6 +331,236 @@ def _build_risk_gain_frame(ranked: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _ticker_monthly_snapshot_dates(
+    prices: pd.DataFrame,
+    ticker: str,
+    as_of: date,
+    months: int = 12,
+) -> list[pd.Timestamp]:
+    if prices.empty:
+        return []
+    px = prices.copy()
+    px["date"] = pd.to_datetime(px["date"])
+    px = px[(px["ticker"] == ticker) & (px["date"] <= pd.Timestamp(as_of))]
+    if px.empty:
+        return []
+    month_ends = px.groupby(px["date"].dt.to_period("M"))["date"].max().sort_values()
+    snapshot_dates: list[pd.Timestamp] = []
+    asof_period = pd.Timestamp(as_of).to_period("M")
+    for m in range(months, 0, -1):
+        target = asof_period - m
+        if target in month_ends.index:
+            snapshot_dates.append(month_ends.loc[target])
+    return snapshot_dates
+
+
+def _price_column(df_prices: pd.DataFrame) -> str:
+    if "adj_close" in df_prices.columns:
+        return "adj_close"
+    return "close"
+
+
+def _build_snapshot_price_map(prices: pd.DataFrame, ticker: str) -> pd.Series:
+    if prices.empty:
+        return pd.Series(dtype=float)
+    px_col = _price_column(prices)
+    px = prices[prices["ticker"] == ticker][["date", px_col]].copy()
+    if px.empty:
+        return pd.Series(dtype=float)
+    px["date"] = pd.to_datetime(px["date"])
+    px = px.drop_duplicates(subset=["date"]).set_index("date").sort_index()
+    return pd.to_numeric(px[px_col], errors="coerce")
+
+
+def _compute_ticker_snapshot_history(
+    cfg: AppConfig,
+    as_of: date,
+    ticker: str,
+    use_cache: bool,
+    months: int = 12,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    ticker = normalize_for_yahoo(ticker)
+    _, prices, funds = _load_snapshot_inputs(as_of=as_of, use_cache=use_cache, period="10y", focus_ticker=ticker)
+    dates = _ticker_monthly_snapshot_dates(prices=prices, ticker=ticker, as_of=as_of, months=months)
+    if not dates:
+        return pd.DataFrame(), pd.DataFrame()
+
+    rows: list[dict] = []
+    price_map = _build_snapshot_price_map(prices, ticker)
+    current_price = float(price_map.iloc[-1]) if not price_map.empty else float("nan")
+
+    for snap_date in dates:
+        hist = prices[pd.to_datetime(prices["date"]) <= snap_date].copy()
+        factors = build_factor_frame(df_price=hist, df_fund=funds, cfg=cfg)
+        scored = build_factor_scores(factors=factors, cfg=cfg)
+        ranked = compute_final_scores(scores=scored)
+        rg = _build_risk_gain_frame(ranked)
+
+        row = ranked[ranked["ticker"] == ticker].head(1)
+        row_rg = rg[rg["ticker"] == ticker].head(1)
+        close_px = float(price_map.loc[snap_date]) if snap_date in price_map.index else float("nan")
+
+        rec: dict = {
+            "snapshot_date": snap_date.date().isoformat(),
+            "ticker": ticker,
+            "included": not row.empty,
+            "close_price": close_px,
+            "return_to_asof": (current_price / close_px - 1.0) if close_px and close_px == close_px and current_price == current_price else float("nan"),
+        }
+        if not row.empty:
+            for c in [
+                "rank",
+                "final_score",
+                "value_score",
+                "quality_score",
+                "growth_score",
+                "stability_score",
+                "momentum_score",
+                "trailingPE",
+                "priceToSalesTrailing12Months",
+                "pegRatio",
+            ]:
+                if c in row.columns:
+                    rec[c] = row.iloc[0][c]
+        if not row_rg.empty:
+            for c in ["gain_score", "risk_score", "reward_to_risk", "risk_band"]:
+                if c in row_rg.columns:
+                    rec[c] = row_rg.iloc[0][c]
+        rows.append(rec)
+
+    snap_df = pd.DataFrame(rows).sort_values("snapshot_date").reset_index(drop=True)
+    if not snap_df.empty:
+        snap_df["snapshot_date"] = pd.to_datetime(snap_df["snapshot_date"])
+        snap_df["next_month_return"] = snap_df["close_price"].shift(-1) / snap_df["close_price"] - 1.0
+        snap_df["snapshot_date"] = snap_df["snapshot_date"].dt.date.astype(str)
+
+    return snap_df, funds
+
+
+def _render_ticker_snapshot_screen(cfg: AppConfig, args: dict[str, object]) -> None:
+    st.subheader("Ticker 12-Month Snapshot Check")
+    st.caption("Run monthly historical snapshots to inspect how the model would have scored a ticker over the last year.")
+
+    c1, c2 = st.columns([2, 1])
+    input_ticker = c1.text_input("Ticker", value="AAPL", help="Any Yahoo-compatible ticker symbol.")
+    months = c2.slider("Months back", min_value=6, max_value=24, value=12, step=1)
+
+    run = st.button("Run 12M Snapshot", type="primary")
+    if not run:
+        st.info("Enter a ticker and click Run 12M Snapshot.")
+        return
+
+    ticker = normalize_for_yahoo(input_ticker.strip())
+    if not ticker:
+        st.error("Please enter a valid ticker.")
+        return
+
+    with st.spinner(f"Calculating snapshot history for {ticker}..."):
+        try:
+            hist_df, funds = _compute_ticker_snapshot_history(
+                cfg=cfg,
+                as_of=args["as_of"],
+                ticker=ticker,
+                use_cache=bool(args["use_cache"]),
+                months=months,
+            )
+        except Exception as exc:
+            st.error(f"Unable to compute snapshots right now: {exc}")
+            st.info("Tip: enable cache or check network access, then retry.")
+            return
+
+    if hist_df.empty:
+        st.warning("No snapshot data available for this ticker in the selected period.")
+        return
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Snapshots", f"{len(hist_df)}")
+    included_ratio = 100.0 * hist_df["included"].mean()
+    m2.metric("Included in Model", f"{included_ratio:.0f}%")
+    if "next_month_return" in hist_df.columns and hist_df["next_month_return"].notna().any():
+        m3.metric("Avg Next-Month Return", f"{hist_df['next_month_return'].mean() * 100:.2f}%")
+    else:
+        m3.metric("Avg Next-Month Return", "N/A")
+
+    fig_score = px.line(
+        hist_df,
+        x="snapshot_date",
+        y="final_score",
+        markers=True,
+        title=f"{ticker} Final Score over time",
+    )
+    fig_score.update_layout(height=320, xaxis_title="Snapshot date", yaxis_title="Final score")
+    st.plotly_chart(fig_score, width="stretch")
+
+    if "rank" in hist_df.columns:
+        rank_df = hist_df.copy()
+        fig_rank = px.line(rank_df, x="snapshot_date", y="rank", markers=True, title=f"{ticker} Rank over time")
+        fig_rank.update_layout(height=320, xaxis_title="Snapshot date", yaxis_title="Rank (lower is better)")
+        fig_rank.update_yaxes(autorange="reversed")
+        st.plotly_chart(fig_rank, width="stretch")
+
+    if {"risk_score", "gain_score"}.issubset(hist_df.columns):
+        fig_rg = px.scatter(
+            hist_df,
+            x="risk_score",
+            y="gain_score",
+            color="snapshot_date",
+            size="reward_to_risk" if "reward_to_risk" in hist_df.columns else None,
+            title=f"{ticker} Risk vs Gain by snapshot",
+            hover_data={"snapshot_date": True, "rank": True, "final_score": ":.2f", "next_month_return": ":.2%"},
+        )
+        fig_rg.update_layout(height=360, xaxis_title="Risk score (higher riskier)", yaxis_title="Gain score")
+        st.plotly_chart(fig_rg, width="stretch")
+
+    peg_col = "pegRatio" if "pegRatio" in funds.columns else "trailingPegRatio" if "trailingPegRatio" in funds.columns else None
+    raw_cols = [c for c in ["ticker", "trailingPE", "priceToSalesTrailing12Months"] if c in funds.columns]
+    if peg_col:
+        raw_cols.append(peg_col)
+    raw_row = funds[funds["ticker"] == ticker]
+    if not raw_row.empty and raw_cols:
+        raw_display = raw_row[raw_cols].copy()
+        if peg_col and peg_col != "pegRatio":
+            raw_display = raw_display.rename(columns={peg_col: "pegRatio"})
+        st.caption("Current raw valuation fields from fundamentals snapshot")
+        st.dataframe(raw_display, hide_index=True, width="stretch")
+
+    st.caption("Snapshot table")
+    show_cols = [
+        c
+        for c in [
+            "snapshot_date",
+            "included",
+            "rank",
+            "final_score",
+            "value_score",
+            "quality_score",
+            "growth_score",
+            "stability_score",
+            "momentum_score",
+            "gain_score",
+            "risk_score",
+            "reward_to_risk",
+            "next_month_return",
+            "return_to_asof",
+        ]
+        if c in hist_df.columns
+    ]
+    st.dataframe(hist_df[show_cols], hide_index=True, width="stretch")
+
+    with st.expander("How this snapshot check works"):
+        st.markdown(
+            """
+- For each month in the selected lookback window, the app takes a month-end snapshot date.
+- It recomputes the full cross-sectional ranking model using data available up to that date.
+- It then extracts the selected ticker's score/rank for that snapshot.
+- `next_month_return` is the realized price return to the next snapshot month.
+- `return_to_asof` is the realized return from the snapshot date to the current as-of date.
+- Fundamental fields are taken from the latest fundamentals snapshot (not true historical point-in-time fundamentals).
+- This helps evaluate whether higher historical scores tended to align with better realized outcomes.
+"""
+        )
+
+
 def _render_calculation_explanation(cfg: AppConfig, args: dict[str, object]) -> None:
     st.subheader("What This App Is Doing")
     universe_label = str(args["universe_mode"])
@@ -411,7 +658,7 @@ def main() -> None:
     st.caption("Nasdaq-100 ranking and backtest dashboard")
 
     cfg, args = _apply_sidebar_config()
-    tab_dashboard, tab_info = st.tabs(["Dashboard", "How It Works"])
+    tab_dashboard, tab_ticker, tab_info = st.tabs(["Dashboard", "Ticker 12M Check", "How It Works"])
 
     with tab_dashboard:
         left, right = st.columns([1, 1])
@@ -589,6 +836,9 @@ def main() -> None:
 
     with tab_info:
         _render_calculation_explanation(cfg, args)
+
+    with tab_ticker:
+        _render_ticker_snapshot_screen(cfg, args)
 
 
 if __name__ == "__main__":
