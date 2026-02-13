@@ -279,6 +279,41 @@ def _run_backtest(cfg: AppConfig, args: dict[str, object], prices: pd.DataFrame,
     return perf
 
 
+def _build_risk_gain_frame(ranked: pd.DataFrame) -> pd.DataFrame:
+    if ranked.empty or "ticker" not in ranked.columns:
+        return pd.DataFrame()
+
+    df = ranked.copy()
+
+    gain_components = [c for c in ["value_score", "quality_score", "growth_score", "momentum_score"] if c in df.columns]
+    if gain_components:
+        df["gain_score"] = df[gain_components].mean(axis=1)
+    else:
+        fallback_gain = [c for c in ["final_score", "score", "mom_12_1", "revenueGrowth", "earningsGrowth"] if c in df.columns]
+        if not fallback_gain:
+            return pd.DataFrame()
+        df["gain_score"] = df[fallback_gain].mean(axis=1)
+
+    if "stability_score" in df.columns:
+        df["risk_score"] = (100.0 - df["stability_score"]).clip(lower=0.0, upper=100.0)
+    else:
+        fallback_risk = [c for c in ["beta", "vol_63d", "max_drawdown_252d", "debtToEquity"] if c in df.columns]
+        if fallback_risk:
+            # In this pipeline those columns are already "higher is better" percentile scores.
+            # Convert to risk by inversion.
+            df["risk_score"] = (100.0 - df[fallback_risk].mean(axis=1)).clip(lower=0.0, upper=100.0)
+        else:
+            df["risk_score"] = 50.0
+
+    df["reward_to_risk"] = df["gain_score"] / (df["risk_score"] + 1.0)
+    df["risk_band"] = pd.cut(
+        df["risk_score"],
+        bins=[-0.1, 25, 50, 75, 100],
+        labels=["Low risk", "Medium risk", "High risk", "Very high risk"],
+    )
+    return df
+
+
 def _render_calculation_explanation(cfg: AppConfig, args: dict[str, object]) -> None:
     st.subheader("What This App Is Doing")
     universe_label = str(args["universe_mode"])
@@ -345,6 +380,19 @@ def _render_calculation_explanation(cfg: AppConfig, args: dict[str, object]) -> 
 - **Growth Score**: Revenue and earnings growth strength.
 - **Stability Score**: Balance-sheet and price-risk stability (debt, beta, volatility, drawdown).
 - **Momentum Score**: 12-1 month trend signal.
+"""
+    )
+    st.subheader("How to Read the Risk/Gain Dashboard")
+    st.markdown(
+        """
+- **Gain Score**: A blended upside proxy from Value, Quality, Growth, and Momentum sub-scores.
+- **Risk Score**: A downside proxy derived primarily from stability (debt, volatility, drawdown, beta).
+- **Reward/Risk**: `Gain Score / (Risk Score + 1)`. Higher usually means better upside per unit of model risk.
+- **Scatter chart**:
+  - Move **up** for stronger upside profile.
+  - Move **left** for lower estimated risk.
+  - Bigger bubble means stronger reward/risk.
+- This is a model-based heuristic to compare candidates, not a guarantee of future returns.
 """
     )
     with st.expander("Important caveats"):
@@ -489,6 +537,55 @@ def main() -> None:
                 fig_dd.add_trace(go.Scatter(x=perf["rebalance_date"], y=perf["benchmark_dd"], mode="lines", name="QQQ DD"))
                 fig_dd.update_layout(height=360, yaxis_title="Drawdown")
                 st.plotly_chart(fig_dd, width="stretch")
+
+            st.subheader("Risk/Gain Dashboard")
+            risk_gain = _build_risk_gain_frame(ranked)
+            if risk_gain.empty:
+                st.info("Not enough data to build risk/gain analysis for this run.")
+            else:
+                top_rg = risk_gain.sort_values("rank").head(len(topn))
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Avg Gain Score (Top N)", f"{top_rg['gain_score'].mean():.1f}")
+                m2.metric("Avg Risk Score (Top N)", f"{top_rg['risk_score'].mean():.1f}")
+                m3.metric("Avg Reward/Risk (Top N)", f"{top_rg['reward_to_risk'].mean():.2f}")
+
+                fig_rg = px.scatter(
+                    risk_gain,
+                    x="risk_score",
+                    y="gain_score",
+                    size="reward_to_risk",
+                    color="final_score",
+                    hover_name="ticker",
+                    hover_data={
+                        "rank": True,
+                        "final_score": ":.2f",
+                        "risk_score": ":.1f",
+                        "gain_score": ":.1f",
+                        "reward_to_risk": ":.2f",
+                        "risk_band": True,
+                    },
+                    title="Risk vs Gain Map (all ranked tickers)",
+                )
+                fig_rg.update_layout(height=460, xaxis_title="Risk Score (higher = riskier)", yaxis_title="Gain Score (higher = stronger upside profile)")
+                st.plotly_chart(fig_rg, width="stretch")
+
+                st.caption("Reward/Risk is a model-derived proxy: Gain Score divided by Risk Score + 1.")
+                with st.expander("How to interpret this Risk/Gain section"):
+                    st.markdown(
+                        """
+- **Gain Score** combines valuation, quality, growth, and momentum sub-scores.
+- **Risk Score** reflects model-estimated downside risk (higher means riskier).
+- **Reward/Risk** compares upside profile against risk profile.
+- A practical preference is often names in the **upper-left** (higher gain, lower risk),
+  but final decisions should include your own thesis, horizon, and risk tolerance.
+"""
+                    )
+                rr_cols = [c for c in ["ticker", "rank", "final_score", "gain_score", "risk_score", "reward_to_risk", "risk_band"] if c in risk_gain.columns]
+                st.dataframe(
+                    risk_gain[rr_cols].sort_values("reward_to_risk", ascending=False).head(15),
+                    hide_index=True,
+                    width="stretch",
+                )
 
     with tab_info:
         _render_calculation_explanation(cfg, args)
