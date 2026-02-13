@@ -10,7 +10,13 @@ import streamlit as st
 from borsa.backtest import run_monthly_backtest
 from borsa.config import AppConfig
 from borsa.data_fetch import get_or_fetch_benchmark, get_or_fetch_fundamentals, get_or_fetch_prices
-from borsa.factors import build_factor_frame, filter_diagnostics
+from borsa.factors import (
+    build_factor_frame,
+    compute_momentum_factors,
+    compute_quality_value_factors,
+    compute_risk_factors,
+    filter_diagnostics,
+)
 from borsa.scoring import FACTOR_SPECS, build_factor_scores, compute_final_scores, select_top_n
 from borsa.universe import get_nasdaq100_tickers, normalize_for_yahoo
 
@@ -396,8 +402,20 @@ def _compute_ticker_snapshot_history(
         ranked = compute_final_scores(scores=scored)
         rg = _build_risk_gain_frame(ranked)
 
+        # Diagnostic fallback: include selected ticker even if strict filters exclude it.
+        mom_all = compute_momentum_factors(hist, cfg)
+        risk_all = compute_risk_factors(hist, funds, cfg)
+        qv_all = compute_quality_value_factors(funds)
+        factors_all = mom_all.merge(risk_all, on="ticker", how="outer").merge(qv_all, on="ticker", how="outer")
+        cfg_diag = cfg.model_copy(deep=True)
+        cfg_diag.filters.max_missing_factor_ratio = 1.0
+        ranked_diag = compute_final_scores(build_factor_scores(factors=factors_all, cfg=cfg_diag))
+        rg_diag = _build_risk_gain_frame(ranked_diag)
+
         row = ranked[ranked["ticker"] == ticker].head(1)
         row_rg = rg[rg["ticker"] == ticker].head(1)
+        row_diag = ranked_diag[ranked_diag["ticker"] == ticker].head(1)
+        row_rg_diag = rg_diag[rg_diag["ticker"] == ticker].head(1)
         close_px = float(price_map.loc[snap_date]) if snap_date in price_map.index else float("nan")
 
         rec: dict = {
@@ -408,6 +426,7 @@ def _compute_ticker_snapshot_history(
             "return_to_asof": (current_price / close_px - 1.0) if close_px and close_px == close_px and current_price == current_price else float("nan"),
         }
         if not row.empty:
+            rec["score_mode"] = "model"
             for c in [
                 "rank",
                 "final_score",
@@ -422,10 +441,32 @@ def _compute_ticker_snapshot_history(
             ]:
                 if c in row.columns:
                     rec[c] = row.iloc[0][c]
+        elif not row_diag.empty:
+            rec["score_mode"] = "diagnostic_estimate"
+            for c in [
+                "rank",
+                "final_score",
+                "value_score",
+                "quality_score",
+                "growth_score",
+                "stability_score",
+                "momentum_score",
+                "trailingPE",
+                "priceToSalesTrailing12Months",
+                "pegRatio",
+            ]:
+                if c in row_diag.columns:
+                    rec[c] = row_diag.iloc[0][c]
+        else:
+            rec["score_mode"] = "missing"
         if not row_rg.empty:
             for c in ["gain_score", "risk_score", "reward_to_risk", "risk_band"]:
                 if c in row_rg.columns:
                     rec[c] = row_rg.iloc[0][c]
+        elif not row_rg_diag.empty:
+            for c in ["gain_score", "risk_score", "reward_to_risk", "risk_band"]:
+                if c in row_rg_diag.columns:
+                    rec[c] = row_rg_diag.iloc[0][c]
         rows.append(rec)
 
     snap_df = pd.DataFrame(rows).sort_values("snapshot_date").reset_index(drop=True)
@@ -590,6 +631,7 @@ def _render_ticker_snapshot_screen(cfg: AppConfig, args: dict[str, object]) -> N
         for c in [
             "snapshot_date",
             "included",
+            "score_mode",
             "rank",
             "final_score",
             "value_score",
@@ -613,6 +655,8 @@ def _render_ticker_snapshot_screen(cfg: AppConfig, args: dict[str, object]) -> N
 - For each month in the selected lookback window, the app takes a month-end snapshot date.
 - It recomputes the full cross-sectional ranking model using data available up to that date.
 - It then extracts the selected ticker's score/rank for that snapshot.
+- If the ticker fails strict model filters, the app shows a `diagnostic_estimate` score mode
+  so you can still track directional behavior over time.
 - `next_month_return` is the realized price return to the next snapshot month.
 - `return_to_asof` is the realized return from the snapshot date to the current as-of date.
 - Fundamental fields are taken from the latest fundamentals snapshot (not true historical point-in-time fundamentals).
